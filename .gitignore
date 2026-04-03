@@ -1,0 +1,17 @@
+# Ignore Python virtual environment
+.venv/
+
+# Ignore local output data
+output/
+
+# Ignore specific data files
+*.tsv
+*.csv
+*.xlsx
+
+# Ignore OS-specific metadata
+.DS_Store
+Thumbs.db
+
+# Ignore backup files
+*.bak
