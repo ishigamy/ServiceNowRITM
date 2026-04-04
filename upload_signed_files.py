@@ -50,13 +50,17 @@ from requests.auth import HTTPBasicAuth
 
 _HTTP_TIMEOUT = 30
 
+# ServiceNow state values for sc_task
+_STATE_OPEN             = "1"
+_STATE_WORK_IN_PROGRESS = "2"
+
 
 # SERVICE-NOW CLIENT
 class ServiceNowClient:
     _RITM_FIELDS = "sys_id,number,short_description,cat_item,cmdb_ci,quantity"
-    # States 3=Closed Complete, 4=Closed Incomplete, 7=Cancelled
-    _SCTASK_OPEN_FILTER = "state!=3^state!=4^state!=7"
-    _SCTASK_FIELDS = "number,short_description,state,assigned_to"
+    # States 3=Closed Complete, 4=Closed Incomplete, 6=Closed Skipped, 7=Cancelled
+    _SCTASK_OPEN_FILTER = "state!=3^state!=4^state!=6^state!=7"
+    _SCTASK_FIELDS = "sys_id,number,short_description,state,assigned_to"
 
     def __init__(self, instance: str, username: str, password: str) -> None:
         if not instance or "/" in instance or instance.startswith("http"):
@@ -107,6 +111,59 @@ class ServiceNowClient:
         except requests.RequestException as exc:
             print(f"    [warn] Request failed fetching SCTASKs for {ritm_sys_id}: {exc}")
             return []
+
+    def upload_attachment(self, table_sys_id: str, filename: str, pdf_bytes: bytes) -> bool:
+        """Upload a PDF as an attachment to a sc_req_item record."""
+        url = f"{self._base}/api/now/attachment/file"
+        params = {
+            "table_name": "sc_req_item",
+            "table_sys_id": table_sys_id,
+            "file_name": filename,
+        }
+        headers = {"Content-Type": "application/pdf"}
+        try:
+            r = self._session.post(
+                url,
+                params=params,
+                headers=headers,
+                data=pdf_bytes,
+                timeout=_HTTP_TIMEOUT,
+            )
+            r.raise_for_status()
+            return True
+        except requests.HTTPError as exc:
+            print(f"    [warn] Attachment upload failed (HTTP {exc.response.status_code}): {exc}")
+            return False
+        except requests.RequestException as exc:
+            print(f"    [warn] Attachment upload failed: {exc}")
+            return False
+
+    def update_sctask(self, sctask_sys_id: str, state: str, assigned_to_email: str) -> bool:
+        """
+        PATCH a single sc_task: update state and assign to a user by email.
+        Uses sysparm_input_display_value=true so ServiceNow resolves the email
+        to a sys_user record automatically.
+        """
+        url = f"{self._base}/api/now/table/sc_task/{sctask_sys_id}"
+        params = {"sysparm_input_display_value": "true"}
+        payload: dict = {"state": state}
+        if assigned_to_email:
+            payload["assigned_to"] = assigned_to_email
+        try:
+            r = self._session.patch(
+                url,
+                params=params,
+                json=payload,
+                timeout=_HTTP_TIMEOUT,
+            )
+            r.raise_for_status()
+            return True
+        except requests.HTTPError as exc:
+            print(f"    [warn] SCTASK update failed (HTTP {exc.response.status_code}): {exc}")
+            return False
+        except requests.RequestException as exc:
+            print(f"    [warn] SCTASK update failed: {exc}")
+            return False
 
     def _query_ritms(self, query: str, limit: Optional[int] = None) -> list:
         url = f"{self._base}/api/now/table/sc_req_item"
@@ -163,15 +220,90 @@ def get_ritm_numbers_from_output(output_dir: str) -> list[str]:
     return found
 
 
+def process_ritm(client: ServiceNowClient, ritm_number: str, output_dir: str, assigned_to_email: str) -> None:
+    """Look up a single RITM, upload its PDF, and move Open SCTASKs to Work in Progress."""
+    print(f"\n{'─' * 60}")
+    print(f"  {ritm_number}")
+    print(f"{'─' * 60}")
+
+    # --- Fetch RITM ---
+    record = client.get_ritm_by_number(ritm_number)
+    if not record:
+        print(f"  [skip] No record found in ServiceNow.")
+        return
+
+    ServiceNowClient.normalise_ritm(record)
+    sys_id = record.get("sys_id", "")
+
+    print(f"  Short description: {record.get('short_description')}")
+    print(f"  Catalog item:      {record.get('cat_item')}")
+    print(f"  CMDB CI:           {record.get('cmdb_ci')}")
+    print(f"  Quantity:          {record.get('quantity')}")
+
+    if not sys_id:
+        print(f"  [skip] No sys_id on record — cannot continue.")
+        return
+
+    # --- Fetch open SCTASKs ---
+    tasks = client.get_open_sctasks_for_ritm(sys_id)
+    if tasks:
+        print(f"\n  Open SCTASKs ({len(tasks)}):")
+        for task in tasks:
+            num   = ServiceNowClient._str_val(task.get("number"))
+            desc  = ServiceNowClient._str_val(task.get("short_description"))
+            state = ServiceNowClient._str_val(task.get("state"))
+            who   = ServiceNowClient._str_val(task.get("assigned_to"))
+            print(f"    {num}  [{state}]  {desc}  →  {who or '(unassigned)'}")
+    else:
+        print(f"\n  No open SCTASKs found.")
+
+    # --- Upload PDF attachment ---
+    pdf_filename = f"{ritm_number}.pdf"
+    pdf_path = os.path.join(output_dir, pdf_filename)
+
+    if not os.path.isfile(pdf_path):
+        print(f"\n  [skip] PDF not found locally: {pdf_filename}")
+        return
+
+    print(f"\n  Uploading {pdf_filename} …", end=" ", flush=True)
+    with open(pdf_path, "rb") as fh:
+        pdf_bytes = fh.read()
+    upload_ok = client.upload_attachment(sys_id, pdf_filename, pdf_bytes)
+    print("OK" if upload_ok else "FAILED")
+
+    if not upload_ok:
+        return
+
+    # --- Transition Open SCTASKs → Work in Progress ---
+    if not tasks:
+        return
+
+    print(f"\n  Updating Open SCTASKs to Work in Progress …")
+    for task in tasks:
+        task_sys_id = ServiceNowClient._str_val(task.get("sys_id"))
+        task_num    = ServiceNowClient._str_val(task.get("number"))
+        task_state  = ServiceNowClient._str_val(task.get("state"))
+
+        if task_state.lower() != "open":
+            print(f"    {task_num}  [{task_state}] — skipped (not Open)")
+            continue
+
+        print(f"    {task_num}  Open → Work in Progress, assigned to {assigned_to_email} …", end=" ", flush=True)
+        ok = client.update_sctask(task_sys_id, _STATE_WORK_IN_PROGRESS, assigned_to_email)
+        print("OK" if ok else "FAILED")
+
+
 # MAIN
 def main() -> None:
     # --- Credentials ---
-    instance = "vubdev.service-now.com"
+    instance = os.environ.get("SN_INSTANCE", "").strip()
     username = os.environ.get("SN_USERNAME", "").strip()
 
     if not instance or not username:
         print("[error] Set SN_INSTANCE and SN_USERNAME environment variables first.")
         sys.exit(1)
+
+    user_email = username
 
     password = getpass.getpass(f"ServiceNow password for {username}: ")
     if not password:
@@ -194,8 +326,7 @@ def main() -> None:
         sys.exit(0)
 
     print(f"Found {len(ritm_numbers)} RITM PDF(s) in output folder.")
-    target = ritm_numbers[0]
-    print(f"Looking up: {target}\n")
+    print(f"Tasks will be assigned to: {user_email}")
 
     # --- Connect + auth check ---
     client = ServiceNowClient(instance, username, password)
@@ -205,39 +336,13 @@ def main() -> None:
         client.close()
         sys.exit(1)
 
-    # --- Fetch RITM ---
-    record = client.get_ritm_by_number(target)
-
-    if not record:
-        print(f"[info] No record found for {target}.")
-        client.close()
-        sys.exit(0)
-
-    ServiceNowClient.normalise_ritm(record)
-
-    print(f"  Number:            {record.get('number')}")
-    print(f"  Short description: {record.get('short_description')}")
-    print(f"  Catalog item:      {record.get('cat_item')}")
-    print(f"  CMDB CI:           {record.get('cmdb_ci')}")
-    print(f"  Quantity:          {record.get('quantity')}")
-    print(f"  sys_id:            {record.get('sys_id')}")
-
-    # --- Fetch open SCTASKs ---
-    sys_id = record.get("sys_id", "")
-    if sys_id:
-        tasks = client.get_open_sctasks_for_ritm(sys_id)
-        if tasks:
-            print(f"\n  Open SCTASKs ({len(tasks)}):")
-            for task in tasks:
-                num   = ServiceNowClient._str_val(task.get("number"))
-                desc  = ServiceNowClient._str_val(task.get("short_description"))
-                state = ServiceNowClient._str_val(task.get("state"))
-                who   = ServiceNowClient._str_val(task.get("assigned_to"))
-                print(f"    {num}  [{state}]  {desc}  →  {who or '(unassigned)'}")
-        else:
-            print("\n  No open SCTASKs found.")
+    # --- Process each RITM ---
+    for ritm_number in ritm_numbers:
+        process_ritm(client, ritm_number, output_dir, user_email)
 
     client.close()
+    print(f"\n{'─' * 60}")
+    print(f"Done. Processed {len(ritm_numbers)} RITM(s).")
 
 
 if __name__ == "__main__":
