@@ -52,7 +52,7 @@ _HTTP_TIMEOUT = 30
 
 # ServiceNow state values for sc_task
 _STATE_OPEN             = "1"
-_STATE_WORK_IN_PROGRESS = "2"
+_STATE_CLOSED_COMPLETE  = "3"
 
 
 # SERVICE-NOW CLIENT
@@ -278,18 +278,18 @@ def process_ritm(client: ServiceNowClient, ritm_number: str, output_dir: str, as
     if not tasks:
         return
 
-    print(f"\n  Updating Open SCTASKs to Work in Progress …")
+    print(f"\n  Updating Open SCTASKs to Closed Complete …")
     for task in tasks:
         task_sys_id = ServiceNowClient._str_val(task.get("sys_id"))
         task_num    = ServiceNowClient._str_val(task.get("number"))
         task_state  = ServiceNowClient._str_val(task.get("state"))
 
-        if task_state.lower() != "open":
-            print(f"    {task_num}  [{task_state}] — skipped (not Open)")
+        if task_state.lower() not in ("open", "work in progress"):
+            print(f"    {task_num}  [{task_state}] — skipped (not Open or Work in Progress)")
             continue
 
-        print(f"    {task_num}  Open → Work in Progress, assigned to {assigned_to_email} …", end=" ", flush=True)
-        ok = client.update_sctask(task_sys_id, _STATE_WORK_IN_PROGRESS, assigned_to_email)
+        print(f"    {task_num}  {task_state} → Closed Complete, assigned to {assigned_to_email} …", end=" ", flush=True)
+        ok = client.update_sctask(task_sys_id, _STATE_CLOSED_COMPLETE, assigned_to_email)
         print("OK" if ok else "FAILED")
 
 
@@ -312,7 +312,7 @@ def main() -> None:
 
     # --- Locate output folder ---
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(script_dir, "output")
+    output_dir = os.path.join(script_dir, "output", "Signed RITM")
 
     if not os.path.isdir(output_dir):
         print(f"[error] Output folder not found: {output_dir}")

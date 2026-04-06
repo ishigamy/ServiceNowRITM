@@ -348,6 +348,7 @@ def main() -> None:
     # --- Output dir ---
     output_dir = os.path.join(script_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "Signed RITM"), exist_ok=True)
 
     # --- Connect + auth check ---
     client = ServiceNowClient(instance, username, password)
