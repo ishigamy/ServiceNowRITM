@@ -136,3 +136,7 @@ python upload_signed_files.py
         ├── RITM0012345.pdf         ← signed copies go here
         └── RITM0012346.pdf
 ```
+
+## Acknowledgements
+
+Developed with assistance from Qwen 2.5 Coder 32B (Q4) https://ollama.com/library/qwen2.5-coder:32b-instruct-q4_K_M for code generation and debugging
