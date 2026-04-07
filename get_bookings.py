@@ -201,19 +201,22 @@ class TextReportGenerator:
             with open(self.filepath, "w", encoding="utf-8") as fh:
                 fh.write(f"--- Picking List ({len(ritm_list)} items) ---\n")
                 fh.write(
-                    f"{'RITM':<15} | {'Short Description':<40} | {'Catalog Item':<35} | Qty\n"
+                    f"{'RITM':<15} | {'Short Description':<40} | {'Catalog Item':<35} | {'Serial Nr':<30} | Qty\n"
                 )
-                fh.write("-" * 110 + "\n")
+                fh.write("-" * 143 + "\n")
                 for rec in ritm_list:
-                    num  = _str_val(rec.get("number"))
-                    desc = _str_val(rec.get("short_description"))
-                    item = _str_val(rec.get("cat_item"))
-                    qty  = _str_val(rec.get("quantity"))
+                    num    = _str_val(rec.get("number"))
+                    desc   = _str_val(rec.get("short_description"))
+                    item   = _str_val(rec.get("cat_item"))
+                    serial = _str_val(rec.get("cmdb_ci"))
+                    qty    = _str_val(rec.get("quantity"))
                     if len(desc) > 37:
                         desc = desc[:37] + "…"
                     if len(item) > 32:
                         item = item[:32] + "…"
-                    fh.write(f"{num:<15} | {desc:<40} | {item:<35} | {qty}\n")
+                    if len(serial) > 27:
+                        serial = serial[:27] + "…"
+                    fh.write(f"{num:<15} | {desc:<40} | {item:<35} | {serial:<30} | {qty}\n")
         except OSError as exc:
             print(f"[error] Could not write report: {exc}")
             return
