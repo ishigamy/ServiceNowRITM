@@ -40,11 +40,12 @@ def _setup_venv() -> None:
 
 _setup_venv()
 
-# STANDARD IMPORTS  
+# STANDARD IMPORTS
 import argparse
 import getpass
 import io
 import re
+from datetime import datetime
 from typing import Optional
 
 import requests
@@ -56,6 +57,30 @@ _HTTP_TIMEOUT = 30
 
 
 # HELPERS
+def _check_printer() -> bool:
+    """
+    Return True if a real printer appears to be available.
+    On Windows, warns if the default printer is 'Microsoft Print to PDF'.
+    """
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["powershell", "-Command",
+                 "(Get-CimInstance -ClassName Win32_Printer | Where-Object {$_.Default}).Name"],
+                capture_output=True, text=True, timeout=10,
+            )
+            name = out.stdout.strip()
+            if "print to pdf" in name.lower():
+                print(
+                    "[warn] Your default printer is 'Microsoft Print to PDF'.\n"
+                    "       Install or set a physical printer as default before using -p / -pa.\n"
+                )
+                return False
+        except Exception:
+            pass  # Can't determine — let it try
+    return True
+
+
 def _print_file(filepath: str) -> None:
     """Send *filepath* to the OS default printer (best-effort)."""
     try:
@@ -123,13 +148,13 @@ class ServiceNowClient:
             print(f"[error] Could not reach ServiceNow: {exc}")
             return False
 
-    def get_ritms_from_req(self, req_number: str) -> list:
+    def get_ritms_from_req(self, req_number: str, debug: bool = False) -> list:
         """Return all RITMs belonging to a REQ number."""
-        return self._query_ritms(f"request.number={req_number.upper()}")
+        return self._query_ritms(f"request.number={req_number.upper()}", debug=debug)
 
-    def get_ritm_by_number(self, ritm_number: str) -> Optional[dict]:
+    def get_ritm_by_number(self, ritm_number: str, debug: bool = False) -> Optional[dict]:
         """Return a single RITM record, or None if not found."""
-        results = self._query_ritms(f"number={ritm_number.upper()}", limit=1)
+        results = self._query_ritms(f"number={ritm_number.upper()}", limit=1, debug=debug)
         return results[0] if results else None
 
     def download_pdf_first_page(self, sys_id: str) -> Optional[bytes]:
@@ -154,7 +179,7 @@ class ServiceNowClient:
             return None
 
     # Private helpers
-    def _query_ritms(self, query: str, limit: Optional[int] = None) -> list:
+    def _query_ritms(self, query: str, limit: Optional[int] = None, debug: bool = False) -> list:
         url = f"{self._base}/api/now/table/sc_req_item"
         params: dict = {
             "sysparm_query": query,
@@ -166,6 +191,10 @@ class ServiceNowClient:
 
         try:
             r = self._session.get(url, params=params, timeout=_HTTP_TIMEOUT)
+            if debug:
+                print(f"    [debug] GET {r.url}")
+                print(f"    [debug] Status: {r.status_code}")
+                print(f"    [debug] Body (first 500 chars): {r.text[:500]}")
             r.raise_for_status()
             return r.json().get("result", [])
         except requests.HTTPError as exc:
@@ -190,40 +219,58 @@ class ServiceNowClient:
 
 # TEXT REPORT GENERATOR
 class TextReportGenerator:
-    """Writes a human-readable picking-list .txt file."""
+    """Writes a human-readable picking-list .txt file, sorted by catalog item."""
 
     def __init__(self, output_dir: str, filename: str = "ServiceNow_RITM_Report.txt") -> None:
         self.filepath = os.path.join(output_dir, filename)
 
+    @staticmethod
+    def _trunc(s: str, maxlen: int) -> str:
+        return (s[: maxlen - 1] + "…") if len(s) > maxlen else s
+
     def generate(self, ritm_list: list, send_to_printer: bool = False) -> None:
+        """
+        Write the picking list.  Columns are sized to fit within ~93 chars
+        so the table prints cleanly on A4 portrait at 9pt monospace.
+
+        Layout (~93 chars):
+          RITM (14) | Description (22) | Catalog Item (22) | Config Item (18) | Qty (3)
+        Config Item (serial number) is never truncated.
+        """
+        # Sort by catalog item name (case-insensitive)
+        ritm_list = sorted(
+            ritm_list, key=lambda r: _str_val(r.get("cat_item", "")).lower()
+        )
+
+        w_ritm, w_desc, w_item, w_ci = 14, 22, 22, 18
+        header = (
+            f"{'RITM':<{w_ritm}} | {'Description':<{w_desc}} "
+            f"| {'Catalog Item':<{w_item}} | {'Config Item':<{w_ci}} | Qty"
+        )
+        sep = "-" * len(header)
+
         print(f"\nGenerating text report: {self.filepath}")
         try:
             with open(self.filepath, "w", encoding="utf-8") as fh:
-                fh.write(f"--- Picking List ({len(ritm_list)} items) ---\n")
-                fh.write(
-                    f"{'RITM':<15} | {'Short Description':<40} | {'Catalog Item':<35} | {'Serial Nr':<30} | Qty\n"
-                )
-                fh.write("-" * 143 + "\n")
+                fh.write(f"--- Picking List ({len(ritm_list)} items) ---\n\n")
+                fh.write(header + "\n")
+                fh.write(sep + "\n")
                 for rec in ritm_list:
-                    num    = _str_val(rec.get("number"))
-                    desc   = _str_val(rec.get("short_description"))
-                    item   = _str_val(rec.get("cat_item"))
-                    serial = _str_val(rec.get("cmdb_ci"))
-                    qty    = _str_val(rec.get("quantity"))
-                    if len(desc) > 37:
-                        desc = desc[:37] + "…"
-                    if len(item) > 32:
-                        item = item[:32] + "…"
-                    if len(serial) > 27:
-                        serial = serial[:27] + "…"
-                    fh.write(f"{num:<15} | {desc:<40} | {item:<35} | {serial:<30} | {qty}\n")
+                    num  = _str_val(rec.get("number"))
+                    desc = self._trunc(_str_val(rec.get("short_description")), w_desc)
+                    item = self._trunc(_str_val(rec.get("cat_item")), w_item)
+                    ci   = _str_val(rec.get("cmdb_ci"))  # never truncated
+                    qty  = _str_val(rec.get("quantity"))
+                    fh.write(
+                        f"{num:<{w_ritm}} | {desc:<{w_desc}} "
+                        f"| {item:<{w_item}} | {ci:<{w_ci}} | {qty}\n"
+                    )
         except OSError as exc:
             print(f"[error] Could not write report: {exc}")
             return
 
         if send_to_printer:
             _print_file(self.filepath)
-
 
 
 # PDF PROCESSOR
@@ -250,7 +297,6 @@ class PDFProcessor:
             writer.add_page(reader.pages[0])
             with open(filepath, "wb") as fh:
                 writer.write(fh)
-            print(f"    saved: {ticket_number}.pdf")
         except Exception as exc:  # noqa: BLE001
             print(f"    [warn] PDF processing error for {ticket_number}: {exc}")
             return
@@ -278,18 +324,20 @@ def get_tickets_from_tsv(tsv_path: str) -> list[str]:
         print(f"[warn] Could not read {tsv_path}: {exc}")
     return sorted(found)
 
+
 def get_date_range_from_tsv(tsv_path: str) -> tuple[Optional[str], Optional[str]]:
-    from datetime import datetime
     dates: set[str] = set()
     try:
         with open(tsv_path, encoding="utf-8") as fh:
-            next(fh, None)
+            next(fh, None)  # skip header
             for line in fh:
                 col = line.split("\t")[0].strip()
-                try:
-                    dates.add(datetime.strptime(col, "%d/%m/%Y %H:%M").strftime("%d/%m/%Y"))
-                except ValueError:
-                    pass
+                for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"):
+                    try:
+                        dates.add(datetime.strptime(col, fmt).strftime("%d/%m/%Y"))
+                        break
+                    except ValueError:
+                        continue
     except OSError:
         pass
     if not dates:
@@ -297,18 +345,72 @@ def get_date_range_from_tsv(tsv_path: str) -> tuple[Optional[str], Optional[str]
     sorted_dates = sorted(dates, key=lambda d: d.split("/")[::-1])
     return sorted_dates[0], sorted_dates[-1]
 
+
+# PROGRESS BAR (pacman-style)
+
+
+def _progress_bar(current: int, total: int, width: int = 30, suffix: str = "") -> None:
+    """Draw a pacman-style progress bar: C/c moves through dashes, eating o dots."""
+    # Build the static track: dashes with 'o' every 4th position
+    track = []
+    for i in range(width):
+        track.append("o" if (i + 1) % 4 == 0 else "-")
+
+    # Pacman position (0 … width), stays put if % hasn't changed enough
+    fraction = current / total if total else 1
+    pos = min(int(width * fraction), width)
+    pac = "C" if current % 2 == 0 else "c"
+
+    # Compose the bar
+    bar = ""
+    for i in range(width):
+        if i < pos:
+            bar += "-"       # eaten trail
+        elif i == pos:
+            bar += pac       # pacman
+        elif track[i] == "o":
+            bar += "o"       # upcoming dot
+        else:
+            bar += " "       # space between dots (not yet eaten)
+    if pos >= width:
+        bar = "-" * width    # done
+
+    pct = int(fraction * 100)
+    line = f"\r  ({current}/{total}) [{bar}] {pct}%"
+    if suffix:
+        line += f"  {suffix}"
+    sys.stdout.write(f"{line:<100}")
+    sys.stdout.flush()
+    if current == total:
+        sys.stdout.write("\n")
+
+
 # MAIN
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Download RITM PDFs and generate a picking list from BookingsReportingData.tsv"
     )
+    print_group = parser.add_mutually_exclusive_group()
+    print_group.add_argument(
+        "-p", action="store_true", dest="print_txt",
+        help="Print only the text picking list",
+    )
+    print_group.add_argument(
+        "-pa", action="store_true", dest="print_all",
+        help="Print the text picking list AND all generated PDFs",
+    )
     parser.add_argument(
-        "-p", "--print",
-        action="store_true",
-        dest="print_output",
-        help="Send all generated files to the default printer",
+        "-d", "--debug", action="store_true",
+        help="Print debug info for the first ServiceNow query",
     )
     args = parser.parse_args()
+
+    print_txt = args.print_txt or args.print_all
+    print_pdfs = args.print_all
+
+    # Early printer check when any print flag is active
+    if print_txt and not _check_printer():
+        sys.exit(1)
 
     # --- Credentials ---
     instance = os.environ.get("SN_INSTANCE", "").strip()
@@ -337,7 +439,9 @@ def main() -> None:
     # --- Check accidental large export range ---
     earliest, latest = get_date_range_from_tsv(tsv_path)
     if earliest and latest and earliest != latest:
-        answer = input(f"Date range more than 1 day ({earliest} - {latest}). Do you want to continue? Y/n: ").strip().lower()
+        answer = input(
+            f"Date range more than 1 day ({earliest} - {latest}). Continue? Y/n: "
+        ).strip().lower()
         if answer not in ("", "y"):
             sys.exit(0)
 
@@ -362,20 +466,28 @@ def main() -> None:
         client.close()
         sys.exit(1)
 
-    # --- Fetch RITMs ----
+    # --- Fetch RITMs ---
     print("\nFetching RITM data from ServiceNow …")
     final_ritms: dict[str, dict] = {}
+    first_query = True
+    total = len(raw_tickets)
 
-    for ticket in raw_tickets:
+    for i, ticket in enumerate(raw_tickets, 1):
+        _progress_bar(i, total)
+        debug = args.debug and first_query
         if ticket.startswith("REQ"):
-            children = client.get_ritms_from_req(ticket)
+            children = client.get_ritms_from_req(ticket, debug=debug)
+            if debug:
+                first_query = False
             for child in children:
                 ServiceNowClient.normalise_ritm(child)
                 num = child.get("number", "")
                 if num:
                     final_ritms[num] = child
         elif ticket.startswith("RITM"):
-            result = client.get_ritm_by_number(ticket)
+            result = client.get_ritm_by_number(ticket, debug=debug)
+            if debug:
+                first_query = False
             if result:
                 ServiceNowClient.normalise_ritm(result)
                 final_ritms[ticket] = result
@@ -388,22 +500,23 @@ def main() -> None:
     ritm_list = list(final_ritms.values())
     print(f"Retrieved {len(ritm_list)} RITM(s).")
 
-    # --- Text report ----
-    TextReportGenerator(output_dir).generate(ritm_list, send_to_printer=args.print_output)
+    # --- Text report (sorted by catalog item inside generate()) ---
+    TextReportGenerator(output_dir).generate(ritm_list, send_to_printer=print_txt)
 
     # --- PDFs ---
     print(f"\nDownloading and slicing {len(ritm_list)} PDF(s) …")
     pdf_proc = PDFProcessor(output_dir)
+    pdf_total = len(ritm_list)
 
-    for rec in ritm_list:
+    for i, rec in enumerate(ritm_list, 1):
         num    = rec["number"]
         sys_id = rec["sys_id"]
         if not sys_id:
-            print(f"    [skip] {num} — no sys_id")
+            _progress_bar(i, pdf_total, suffix=f"{num} — skipped")
             continue
-        print(f"  {num} …", end=" ", flush=True)
         raw = client.download_pdf_first_page(sys_id)
-        pdf_proc.save_first_page(num, raw, send_to_printer=args.print_output)
+        pdf_proc.save_first_page(num, raw, send_to_printer=print_pdfs)
+        _progress_bar(i, pdf_total, suffix=f"{num}.pdf")
 
     client.close()
     print(f"\nDone. Files are in: {output_dir}")
