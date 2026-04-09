@@ -43,6 +43,7 @@ _setup_venv()
 # STANDARD IMPORTS
 import getpass
 import re
+import shutil
 from typing import Optional
 
 import requests
@@ -273,6 +274,17 @@ def process_ritm(client: ServiceNowClient, ritm_number: str, output_dir: str, as
 
     if not upload_ok:
         return
+
+    # --- Move PDF to archives ---
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    archive_dir = os.path.join(script_dir, ".archives")
+    os.makedirs(archive_dir, exist_ok=True)
+    archive_path = os.path.join(archive_dir, pdf_filename)
+    try:
+        shutil.move(pdf_path, archive_path)
+        print(f"  Archived → .archives/{pdf_filename}")
+    except OSError as exc:
+        print(f"  [warn] Could not archive {pdf_filename}: {exc}")
 
     # --- Transition Open SCTASKs → Work in Progress ---
     if not tasks:
